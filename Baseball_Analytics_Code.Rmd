@@ -1,0 +1,251 @@
+---
+title: "Expected Total Bases from TrackMan Batted-Ball Data"
+author: "Riley Conner"
+date: "2025-08-21"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## Goal
+
+Predict the total bases a batted ball produces (0, 1, 2, 3 or 4) from TrackMan
+ball-flight measurements, and compare several models on a held-out test set.
+
+I fit two versions of the final random forest:
+
+- **Full model:** uses all six batted-ball measurements, including Distance and
+  HangTime.
+- **Contact-only model:** uses only ExitSpeed, Angle and Direction. Distance and
+  HangTime describe where the ball ended up, so they partly reveal the result
+  (a 400-foot fly ball is almost always a home run). MLB's expected stats use
+  contact measurements for this reason, so this model is the fairer test of how
+  well quality of contact alone predicts the outcome.
+
+```{r libraries}
+library(readxl)
+library(tidyverse)   # includes dplyr, tidyr and ggplot2
+library(randomForest)
+library(knitr)
+```
+
+## Data
+
+The data file `trackman.xlsx` should sit in the same folder as this file.
+
+```{r load-data}
+data <- read_excel("trackman.xlsx")
+```
+
+```{r total-bases}
+# Map PlayResult to total bases. Only hits add bases; every other result is 0.
+numeric_playresult <- c(
+  "Single" = 1,
+  "Double" = 2,
+  "Triple" = 3,
+  "HomeRun" = 4,
+  "-" = 0,
+  "Walk" = 0,
+  "Out" = 0,
+  "Strikeout" = 0,
+  "HitByPitch" = 0,
+  "FieldersChoice" = 0,
+  "Error" = 0,
+  "Sacrifice" = 0,
+  "Groundball" = 0
+)
+
+predictors         <- c("ExitSpeed", "Angle", "Direction", "HitSpinRate", "Distance", "HangTime")
+contact_predictors <- c("ExitSpeed", "Angle", "Direction")
+
+filtered_data <- data %>%
+  mutate(total_bases = unname(numeric_playresult[PlayResult])) %>%
+  select(all_of(predictors), total_bases) %>%
+  mutate(across(everything(), ~ na_if(as.character(.x), "NA"))) %>%  # text "NA" -> real NA
+  mutate(across(everything(), as.numeric)) %>%
+  drop_na()  # keeps only batted balls with complete tracking data
+
+nrow(filtered_data)
+table(filtered_data$total_bases)
+```
+
+## Exploratory data analysis
+
+```{r eda}
+plot_fxn <- function(df, predictor) {
+  ggplot(df, aes(x = factor(total_bases), y = .data[[predictor]])) +
+    geom_boxplot() +
+    labs(title = paste(predictor, "by Total Bases"),
+         x = "Total Bases",
+         y = predictor) +
+    theme_minimal()
+}
+
+for (p in predictors) print(plot_fxn(filtered_data, p))
+```
+
+## Train/test split
+
+The seed is set before the split so the results are the same every time the file runs.
+
+```{r split}
+set.seed(203)
+train_rows <- sample(nrow(filtered_data), size = floor(0.7 * nrow(filtered_data)))
+train <- filtered_data[train_rows, ]
+test  <- filtered_data[-train_rows, ]
+```
+
+## Choosing predictors: nested linear models
+
+Each model adds one predictor. ANOVA tests whether the added predictor
+significantly reduces the residual sum of squares.
+
+```{r linear-anova}
+mod1 <- lm(total_bases ~ ExitSpeed, data = train)
+mod2 <- lm(total_bases ~ ExitSpeed + Angle, data = train)
+mod3 <- lm(total_bases ~ ExitSpeed + Angle + Direction, data = train)
+mod4 <- lm(total_bases ~ ExitSpeed + Angle + Direction + HitSpinRate, data = train)
+mod5 <- lm(total_bases ~ ExitSpeed + Angle + Direction + HitSpinRate + Distance, data = train)
+mod6 <- lm(total_bases ~ ExitSpeed + Angle + Direction + HitSpinRate + Distance + HangTime, data = train)
+
+anova(mod1, mod2)
+anova(mod2, mod3)
+anova(mod3, mod4)
+anova(mod4, mod5)
+anova(mod5, mod6)
+```
+
+## Choosing polynomial degrees
+
+For each predictor, fit polynomials of increasing degree and use ANOVA to see
+which higher-order terms are worth keeping.
+
+```{r poly-anova}
+poly_anova <- function(predictor, max_degree) {
+  fits <- lapply(1:max_degree, function(d) {
+    lm(reformulate(sprintf("poly(%s, %d, raw = TRUE)", predictor, d), "total_bases"),
+       data = train)
+  })
+  do.call(anova, c(fits, test = "Chisq"))
+}
+
+poly_anova("ExitSpeed",   5)
+poly_anova("Angle",       5)
+poly_anova("Direction",   5)
+poly_anova("HitSpinRate", 4)
+poly_anova("Distance",    5)
+poly_anova("HangTime",    3)
+```
+
+## Models
+
+```{r models}
+# Empty model: predicts the training-set mean for every batted ball
+test$empty_pred <- mean(train$total_bases)
+
+# Linear model with the predictors kept by the nested ANOVA
+linear_model <- lm(total_bases ~ ExitSpeed + HitSpinRate + Distance + HangTime, data = train)
+test$linear_pred <- predict(linear_model, newdata = test)
+
+# Polynomial model with the degrees chosen above
+poly_model <- lm(total_bases ~
+                   poly(ExitSpeed, 3, raw = TRUE) +
+                   poly(HitSpinRate, 3, raw = TRUE) +
+                   poly(Distance, 4, raw = TRUE) +
+                   poly(HangTime, 2, raw = TRUE) +
+                   poly(Angle, 4, raw = TRUE) +
+                   poly(Direction, 2, raw = TRUE),
+                 data = train)
+test$poly_pred <- predict(poly_model, newdata = test)
+
+# Interaction models: do two predictors work together?
+interact_es_angle <- lm(total_bases ~ ExitSpeed * Angle,    data = train)
+interact_es_dist  <- lm(total_bases ~ ExitSpeed * Distance, data = train)
+interact_dist_ang <- lm(total_bases ~ Distance * Angle,     data = train)
+test$es_angle_pred <- predict(interact_es_angle, newdata = test)
+test$es_dist_pred  <- predict(interact_es_dist,  newdata = test)
+test$dist_ang_pred <- predict(interact_dist_ang, newdata = test)
+
+# Random forest, all six measurements
+set.seed(203)
+rf_full <- randomForest(reformulate(predictors, "total_bases"),
+                        data = train, importance = TRUE)
+test$rf_full_pred <- predict(rf_full, newdata = test)
+
+# Random forest, contact measurements only (no Distance or HangTime)
+set.seed(203)
+rf_contact <- randomForest(reformulate(contact_predictors, "total_bases"),
+                           data = train, importance = TRUE)
+test$rf_contact_pred <- predict(rf_contact, newdata = test)
+```
+
+## Comparing models on the test set
+
+RMSE is how far off the predictions are, on average, in bases. Lower is better.
+
+```{r rmse}
+rmse <- function(actual, predicted) sqrt(mean((actual - predicted)^2))
+r_squared <- function(actual, predicted) {
+  1 - sum((actual - predicted)^2) / sum((actual - mean(actual))^2)
+}
+
+pred_cols <- c(
+  "Empty"                        = "empty_pred",
+  "Linear"                       = "linear_pred",
+  "Polynomial"                   = "poly_pred",
+  "Exit Speed * Angle"           = "es_angle_pred",
+  "Exit Speed * Distance"        = "es_dist_pred",
+  "Distance * Angle"             = "dist_ang_pred",
+  "Random Forest (all six)"      = "rf_full_pred",
+  "Random Forest (contact only)" = "rf_contact_pred"
+)
+
+results <- tibble(
+  Model   = names(pred_cols),
+  RMSE    = sapply(pred_cols, function(col) rmse(test$total_bases, test[[col]])),
+  Test_R2 = sapply(pred_cols, function(col) r_squared(test$total_bases, test[[col]]))
+) %>%
+  arrange(RMSE)
+
+kable(results, digits = 4, col.names = c("Model", "RMSE", "Test R-squared"))
+```
+
+```{r rmse-plot}
+ggplot(results, aes(x = reorder(Model, -RMSE), y = RMSE)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = "Model", y = "RMSE (bases)", title = "Test RMSE by Model") +
+  theme_minimal()
+```
+
+## Variable importance
+
+Importance is the percent increase in MSE when a predictor's values are shuffled:
+the bigger the increase, the more the model relies on that predictor.
+
+```{r importance}
+importance_df <- function(model, label) {
+  tibble(Feature    = rownames(importance(model)),
+         Importance = importance(model)[, "%IncMSE"],
+         Model      = label)
+}
+
+bind_rows(importance_df(rf_full, "All six measurements"),
+          importance_df(rf_contact, "Contact only")) %>%
+  ggplot(aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  facet_wrap(~ Model, scales = "free_y") +
+  labs(title = "Random Forest Variable Importance",
+       x = "Variable", y = "% Increase in MSE") +
+  theme_minimal()
+```
+
+## Save models
+
+```{r save}
+saveRDS(rf_full,    "rf_full_model.rds")
+saveRDS(rf_contact, "rf_contact_model.rds")
+```
